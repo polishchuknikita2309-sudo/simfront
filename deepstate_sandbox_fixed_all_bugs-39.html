@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Territory Sandbox</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+html,body,#map{height:100%;margin:0}body{font-family:Arial,sans-serif;overflow:hidden;background:#ddd}
+#map{position:fixed;inset:0}
+.panel{position:fixed;z-index:1000;top:12px;left:12px;width:min(500px,calc(100vw - 24px));background:rgba(28,28,28,.95);color:#fff;border-radius:18px;padding:14px;box-shadow:0 8px 28px #0008;box-sizing:border-box}
+h1{font-size:21px;margin:0 0 3px}.sub{font-size:13px;color:#aaa;margin-bottom:10px}.row{display:flex;gap:7px;flex-wrap:wrap}.btn{border:0;border-radius:11px;background:#303030;color:#fff;padding:11px 13px;font-weight:700;font-size:14px;touch-action:manipulation}.btn.active{outline:3px solid #fff}.btn.a{background:#2376d8}.btn.b{background:#c63838}.status{margin-top:10px;font-size:13px;color:#9be18f}.small{margin-top:6px;font-size:11px;color:#999}.leaflet-control-attribution{font-size:10px}
+.capture-line{stroke:#fff;stroke-width:3;stroke-dasharray:8 7;fill:none;opacity:.95}.toast{position:fixed;z-index:1200;right:14px;bottom:14px;max-width:min(360px,calc(100vw - 28px));background:rgba(25,25,25,.94);color:#fff;border-radius:13px;padding:11px 14px;box-shadow:0 6px 22px #0008;font-size:14px;font-weight:700;display:none}.toast.show{display:block}.toast .line{margin:2px 0}.stats{position:fixed;z-index:1100;top:12px;right:12px;width:min(360px,calc(100vw - 24px));max-height:calc(100vh - 24px);overflow:auto;background:rgba(28,28,28,.97);color:#fff;border-radius:18px;padding:16px;box-shadow:0 8px 28px #0008;display:none}.stats h2{margin:0 0 10px;font-size:20px}.statrow{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid #444}.statrow:last-child{border-bottom:0}.statv{font-weight:800}.close{float:right;background:#444;color:#fff;border:0;border-radius:8px;padding:5px 9px}#map{touch-action:none}button{-webkit-user-select:none;user-select:none}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="panel">
+  <h1>Territory Sandbox</h1>
+  <div class="sub">Свободное изменение игровой карты. Можно создавать сколько угодно областей.</div>
+  <div class="row">
+    <button class="btn a active" id="a">🇺🇦 Украина</button>
+    <button class="btn b" id="b">🇷🇺 Россия</button>
+  </div>
+  <div class="row" style="margin-top:7px">
+    <button class="btn" id="draw">⚔️ Наступать</button>
+    <button class="btn" id="fill">🎨 Захватить последнюю</button>
+  </div>
+  <div class="row" style="margin-top:7px">
+    <button class="btn" id="undo">↩️ Отменить</button>
+    <button class="btn" id="clear">🗑️ Очистить свои</button>
+  </div>
+  <div class="row" style="margin-top:7px">
+    <button class="btn" id="center">⌂ Центр</button>
+    <button class="btn" id="fit">□ Показать всю карту</button>
+    <button class="btn" id="stats">📊 Статистика</button>
+  </div>
+  <div class="status" id="status">Карта загружается…</div>
+  <div class="small">Основа карты — ArcGIS. Зажми и рисуй границу пальцем или мышью — отпусти для плавного захвата.</div>
+</div>
+<div class="toast" id="toast"></div>
+<div class="stats" id="statsPanel"><button class="close" id="closeStats">✕</button><h2>📊 Статистика</h2><div id="statsBody"></div></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@turf/turf@7.4.0/turf.min.js"></script>
+<script>
+// Territory Sandbox — robust single-geometry state engine.
+// The map is a territorial sandbox only: no operational military mechanics.
+const map=L.map('map',{zoomControl:true,preferCanvas:false,doubleClickZoom:false,zoomAnimation:true,fadeAnimation:true}).setView([49.0,31.2],6);
+map.on('zoomend moveend',()=>renderGrayZone());
+const street=L.tileLayer('https://services.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}',{maxZoom:19,attribution:'© Esri, HERE, Garmin, USGS'}).addTo(map);
+const satellite=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:19,attribution:'© Esri'});
+const labels=L.tileLayer('https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',{maxZoom:19,opacity:.9,attribution:'© Esri'}).addTo(map);
+L.control.layers({'Обычная карта':street,'Спутник':satellite},{'Названия и границы':labels},{collapsed:true}).addTo(map);
+
+// The gray zone is an actual OUTER band, not a centered line.  That means
+// captured territory never gets gray overlay. Street map = 50%, satellite = 40%.
+function setGrayOpacity(isSatellite){
+  const opacity=isSatellite?0.40:0.50;
+  const pane=document.getElementById('grayZone');
+  if(pane) pane.style.opacity=String(opacity);
+}
+map.on('baselayerchange',e=>setGrayOpacity(e.layer===satellite));
+
+map.createPane('grayZone'); map.getPane('grayZone').style.zIndex=404; map.getPane('grayZone').style.opacity='0.50';
+map.createPane('territory'); map.getPane('territory').style.zIndex=410;
+map.createPane('capture'); map.getPane('capture').style.zIndex=420; map.getPane('capture').style.pointerEvents='none';
+
+const COLORS={A:'#287bd8',B:'#9e2e47'};
+const NAMES={A:'Украина',B:'Россия'};
+const FILL=.40;
+const GRAY_FILL=.50;
+const CAPTURE_MS=500;
+const MIN_AREA=1000;
+
+let owner='A', drawing=false, points=[], temp=null, last=null, history=[];
+let animating=false, activePointer=null, baseData=null, settlements=[], toastTimer=null;
+let state={A:null,B:null};
+const statsData={A:{attacks:0,area:0,settlements:0},B:{attacks:0,area:0,settlements:0}};
+let grayLayer=L.layerGroup().addTo(map);
+let grayZones=null;
+let grayRebuildTimer=null;
+let grayBuildToken=0;
+
+const $=id=>document.getElementById(id);
+const GRAY_WIDTH_KM=2.5; // fixed gray-zone width; no UI slider
+
+
+
+
+function status(t){$('status').textContent=t}
+function clone(f){return f?turf.clone(f):null}
+function area(f){return f&&f.geometry?turf.area(f)/1e6:0}
+function formatArea(v){return v<1?v.toFixed(2):v.toFixed(1)}
+function valid(f){return !!(f&&f.geometry&&turf.area(f)>=MIN_AREA)}
+function clean(f){
+  if(!f||!f.geometry)return null;
+  try{
+    f=turf.cleanCoords(f);
+    if(turf.booleanValid && !turf.booleanValid(f) && turf.unkinkPolygon){
+      const u=turf.unkinkPolygon(f);
+      if(u&&u.features&&u.features.length){
+        if(u.features.length===1)return u.features[0];
+        try{
+          const c=turf.combine(u);
+          if(c&&c.features&&c.features.length)return c.features[0];
+        }catch(_){ }
+      }
+    }
+    return f&&f.geometry?f:null;
+  }catch(_){return f&&f.geometry?f:null}
+}
+function featureCollectionGeometries(items){return turf.featureCollection(items.filter(Boolean).map(clone))}
+function union2(a,b){
+  if(!a)return clone(b); if(!b)return clone(a);
+  try{
+    const u=turf.union(featureCollectionGeometries([a,b]));
+    if(u&&u.geometry)return clean(u);
+  }catch(_){ }
+  try{
+    const c=turf.combine(featureCollectionGeometries([a,b]));
+    if(c&&c.features&&c.features.length)return clean(c.features[0]);
+  }catch(_){ }
+  return clone(a);
+}
+function diff(a,b){
+  if(!a)return null; if(!b)return clone(a);
+  const result=turf.difference(featureCollectionGeometries([a,b]));
+  return clean(result);
+}
+function intersection(a,b){
+  if(!a||!b)return null;
+  try{return clean(turf.intersect(featureCollectionGeometries([a,b])))}catch(_){return null}
+}
+function snapshot(){return {A:clone(state.A),B:clone(state.B),grayZones:clone(grayZones)}}
+function snapshotStats(){return {A:{...statsData.A},B:{...statsData.B}}}
+function snapshotLast(){return last?{feature:clone(last.feature),owner:last.owner}:null}
+function restoreStats(s){statsData.A={...s.A};statsData.B={...s.B}}
+function restore(s){state={A:clone(s.A),B:clone(s.B)};grayZones=clone(s.grayZones);renderState()}
+
+function showToast(lines){
+  const el=$('toast'); el.innerHTML=lines.map(x=>`<div class="line">${escapeHtml(x)}</div>`).join('');
+  el.classList.add('show'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>el.classList.remove('show'),4500);
+}
+function escapeHtml(x){return String(x).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function style(owner,fill=FILL,border=true){return {color:border?COLORS[owner]:'transparent',weight:border?2:0,opacity:border?1:0,fillColor:COLORS[owner],fillOpacity:fill,interactive:false}}
+
+function buildGrayGeometry(){
+  if(!valid(state.B)) return null;
+  try{
+    // Keep the gray zone outside the current red territory only.
+    // Simplify the very detailed source geometry first so mobile browsers do not freeze.
+    let base=state.B;
+    try{
+      const simplified=turf.simplify(state.B,{tolerance:0.004,highQuality:false,mutate:false});
+      if(valid(simplified)) base=simplified;
+    }catch(_){ }
+
+    const outer=turf.buffer(base,GRAY_WIDTH_KM,{units:'kilometers',steps:4});
+    if(!valid(outer)) return null;
+
+    let band=diff(outer,state.B);
+    if(!valid(band)) return null;
+
+    // Never draw gray over any already captured Ukrainian territory.
+    if(valid(state.A)) band=diff(band,state.A);
+    if(!valid(band)) return null;
+
+    return band;
+  }catch(_){
+    return null;
+  }
+}
+function renderGrayZone(){
+  grayLayer.clearLayers();
+  if(!valid(grayZones))return;
+  L.geoJSON(grayZones,{pane:'grayZone',style:{color:'#777',weight:0,opacity:0,fillColor:'#777',fillOpacity:1,interactive:false},interactive:false}).addTo(grayLayer);
+}
+function scheduleGrayRebuild(){
+  clearTimeout(grayRebuildTimer);
+  const token=++grayBuildToken;
+  grayRebuildTimer=setTimeout(()=>{
+    if(animating)return;
+    // One rebuild only after the current state is settled.
+    const next=buildGrayGeometry();
+    if(token!==grayBuildToken)return;
+    grayZones=next;
+    renderGrayZone();
+  },250);
+}
+function addGrayZone(){
+  clearTimeout(grayRebuildTimer);
+  grayBuildToken++;
+  grayZones=buildGrayGeometry();
+  renderGrayZone();
+}
+function rebuildGrayZoneFast(){scheduleGrayRebuild();}
+function rebuildGrayZone(){scheduleGrayRebuild();}
+
+function renderState(skipGrayRebuild=false){
+  if(!skipGrayRebuild) scheduleGrayRebuild();
+  renderGrayZone();
+  territoryLayer.clearLayers();
+  for(const who of ['B','A']){
+    if(!valid(state[who]))continue;
+    L.geoJSON(state[who],{pane:'territory',style:style(who,FILL,false),interactive:false}).addTo(territoryLayer);
+    if(who==='B'){
+      try{
+        const border=turf.boundary(state.B);
+        if(border) L.geoJSON(border,{pane:'territory',style:{color:COLORS.B,weight:2,opacity:1,fillOpacity:0,interactive:false},interactive:false}).addTo(territoryLayer);
+      }catch(_){
+        L.geoJSON(state[who],{pane:'territory',style:style(who,0,true),interactive:false}).addTo(territoryLayer);
+      }
+    }
+  }
+}
+
+function changedSettlements(footprint,oldSt,newSt,newOwner){
+  const out=[];
+  for(const s of settlements){
+    const c=settlementCoords(s); if(!c||!s.name)continue;
+    const pt=turf.point(c);
+    try{
+      if(!turf.booleanPointInPolygon(pt,footprint,{ignoreBoundary:false}))continue;
+      const before=ownerAt(pt,oldSt), after=ownerAt(pt,newSt);
+      if(before!==after && after===newOwner) out.push(String(s.name));
+    }catch(_){ }
+  }
+  return [...new Set(out)];
+}
+
+// Build the final state ONCE before animation. This is the key performance fix:
+// no Turf clipping/union/difference work happens every animation frame.
+function calculateTransition(footprint,newOwner,oldSt){
+  const other=newOwner==='A'?'B':'A';
+  const newSt={A:clone(oldSt.A),B:clone(oldSt.B)};
+
+  // When Ukraine liberates territory, ONLY the part that was actually
+  // under Russian control may change to blue. Existing Ukrainian territory
+  // must stay exactly as it was.
+  if(newOwner==='A'){
+    const changed=intersection(footprint,oldSt.B);
+    newSt.B=diff(oldSt.B,footprint);
+    newSt.A=valid(changed)?union2(oldSt.A,changed):clone(oldSt.A);
+    return {newState:newSt,changed,otherRemoved:changed};
+  }
+
+  // Keep the existing Russia capture behavior unchanged.
+  newSt[other]=diff(oldSt[other],footprint);
+  newSt[newOwner]=union2(oldSt[newOwner],footprint);
+  const changed=diff(footprint,oldSt[newOwner]);
+  return {newState:newSt,changed,otherRemoved:intersection(oldSt[other],footprint)};
+}
+
+// Smooth, cheap reveal. We reveal the precomputed changed polygon with a CSS
+// clip on a dedicated SVG pane; the old map remains untouched until commit.
+function makeStateLayer(st,pane){
+  const g=L.layerGroup();
+  for(const who of ['B','A']){
+    if(!valid(st[who]))continue;
+    L.geoJSON(st[who],{pane,style:style(who,FILL,false),interactive:false}).addTo(g);
+    // Same frontier rule during animation: show the Russian boundary,
+    // including boundaries around Ukrainian pockets inside Russian territory.
+    if(who==='B'){
+      try{
+        const border=turf.boundary(st.B);
+        if(border) L.geoJSON(border,{pane,style:{color:COLORS.B,weight:2,opacity:1,fillOpacity:0,interactive:false},interactive:false}).addTo(g);
+      }catch(_){
+        L.geoJSON(st[who],{pane,style:style(who,0,true),interactive:false}).addTo(g);
+      }
+    }
+  }
+  // Ukrainian territory intentionally has no boundary lines during animation.
+  // The Russian boundary remains visible.
+  return g;
+}
+
+// Smooth replacement animation without a second "capture" color. The old
+// ownership is removed from the changing area first, then the new owner fades
+// into that exact area using its normal map color.
+function animateTransition(footprint,newOwner,oldSt,newSt,changed,after){
+  // Only the animation itself is changed here: the captured territory is
+  // revealed progressively in solid-color strips instead of fading in.
+  const oldVisible={A:clone(oldSt.A),B:clone(oldSt.B)};
+  const other=newOwner==='A'?'B':'A';
+  oldVisible[other]=clone(newSt[other]);
+
+  const oldLayer=makeStateLayer(oldVisible,'territory').addTo(map);
+  const reveal=L.layerGroup().addTo(map);
+  const slices=[];
+
+  if(valid(changed)){
+    try{
+      const [minX,minY,maxX,maxY]=turf.bbox(changed);
+      const count=24;
+      const width=(maxX-minX)/count || 0.000001;
+      for(let i=0;i<count;i++){
+        const x1=minX+i*width;
+        const x2=i===count-1?maxX:minX+(i+1)*width;
+        const strip=turf.polygon([[
+          [x1,minY],[x2,minY],[x2,maxY],[x1,maxY],[x1,minY]
+        ]]);
+        const part=clean(turf.intersect(turf.featureCollection([changed,strip])));
+        if(valid(part))slices.push(L.geoJSON(part,{pane:'capture',style:{color:COLORS[newOwner],weight:0,opacity:1,fillColor:COLORS[newOwner],fillOpacity:FILL,interactive:false}}));
+      }
+    }catch(_){
+      // Safe fallback: show the whole changed geometry solid, without opacity animation.
+      if(valid(changed))slices.push(L.geoJSON(changed,{pane:'capture',style:{color:COLORS[newOwner],weight:0,opacity:1,fillColor:COLORS[newOwner],fillOpacity:FILL,interactive:false}}));
+    }
+  }
+
+  let index=0;
+  const step=Math.max(1,Math.ceil(CAPTURE_MS/Math.max(1,slices.length)));
+  function revealNext(){
+    if(index<slices.length){
+      slices[index++].addTo(reveal);
+      setTimeout(revealNext,step);
+      return;
+    }
+    reveal.remove(); oldLayer.remove();
+    try{
+      state={A:clone(newSt.A),B:clone(newSt.B)};
+      // Do not rebuild the full gray-zone geometry while the map is locked.
+      // That calculation can be expensive on mobile. The territory is
+      // committed immediately, then the gray zone is rebuilt asynchronously.
+      addGrayZone(changed);
+      renderState(true);
+      animating=false;
+      lockMap(false);
+      after();
+    }catch(_){
+      // Never leave the map permanently locked if a geometry/render operation fails.
+      animating=false;
+      lockMap(false);
+      status('Захват завершён, но серая зона не успела обновиться.');
+    }
+  }
+  revealNext();
+}
+
+function finish(){
+  if(animating){status('Подожди завершение текущего наступления.');return}
+  if(points.length<3){status('Нарисуй замкнутую область из трёх или больше точек.');stopDrawing();return}
+  const cleanPts=[];
+  for(const p of points){const q=cleanPts[cleanPts.length-1];if(!q||map.distance(q,p)>=8)cleanPts.push(p)}
+  if(cleanPts.length<3){status('Область слишком маленькая.');stopDrawing();return}
+  const ring=cleanPts.map(p=>[p.lng,p.lat]); ring.push(ring[0]);
+  let footprint=null; try{footprint=clean(turf.polygon([ring]))}catch(_){ }
+  stopDrawing();
+  if(!valid(footprint)){status('Не удалось построить область. Нарисуй её ещё раз.');return}
+
+  const oldSt=snapshot();
+  let tr;
+  try{tr=calculateTransition(footprint,owner,oldSt)}catch(_){
+    status('Не удалось безопасно обработать область. Нарисуй её ещё раз чуть проще.');
+    return;
+  }
+  if(!valid(tr.changed)){
+    status('Эта область уже принадлежит выбранной стороне.');
+    return;
+  }
+  const newSt=tr.newState;
+  const changedArea=area(tr.changed);
+  const settlementsChanged=changedSettlements(footprint,oldSt,newSt,owner);
+  history.push({snapshot:oldSt,stats:snapshotStats(),previousLast:snapshotLast(),shape:clone(footprint),owner});
+  last={feature:clone(footprint),owner};
+  animating=true;
+  status('Захват начался…');
+  lockMap(true);
+  animateTransition(footprint,owner,oldSt,newSt,tr.changed,()=>{
+    statsData[owner].attacks++;
+    statsData[owner].area+=changedArea;
+    statsData[owner].settlements+=settlementsChanged.length;
+    const lines=[`${owner==='A'?'🇺🇦 Украина':'🇷🇺 Россия'} продвижение: ${formatArea(changedArea)} км²`];
+    settlementsChanged.slice(0,8).forEach(n=>lines.push(`${n} ${/а$|я$|ка$|ца$/i.test(n.trim())?'перешла':'перешли'} под контроль: ${owner==='A'?'Украины':'России'}`));
+    if(settlementsChanged.length>8)lines.push(`+ ещё ${settlementsChanged.length-8} населённых пунктов`);
+    showToast(lines);
+    status('Захват завершён — можно рисовать дальше.');
+  });
+}
+
+function lockMap(lock){
+  if(lock){map.dragging.disable();map.scrollWheelZoom.disable();map.doubleClickZoom.disable();map.boxZoom.disable();map.keyboard.disable();if(map.touchZoom)map.touchZoom.disable()}
+  else{map.dragging.enable();map.scrollWheelZoom.enable();map.doubleClickZoom.disable();map.boxZoom.enable();map.keyboard.enable();if(map.touchZoom)map.touchZoom.enable()}
+}
+
+function isDrawingTarget(e){return !e.target.closest('.leaflet-control')&&!e.target.closest('.panel')&&!e.target.closest('.stats')&&!animating}
+const mapEl=map.getContainer();
+function startFreehand(e){
+  if(!drawing||activePointer!==null||!isDrawingTarget(e))return;
+  activePointer=e.pointerId; points=[map.mouseEventToLatLng(e)]; preview(); lockMap(true); try{mapEl.setPointerCapture(e.pointerId)}catch(_){ }
+  e.preventDefault();
+}
+function moveFreehand(e){
+  if(e.pointerId!==activePointer)return;
+  const p=map.mouseEventToLatLng(e),q=points[points.length-1];
+  if(!q||map.distance(q,p)>=6){points.push(p);preview()}
+  e.preventDefault();
+}
+function endFreehand(e){
+  if(e.pointerId!==activePointer)return;
+  try{mapEl.releasePointerCapture(e.pointerId)}catch(_){ }
+  activePointer=null;
+  if(drawing&&points.length)finish(); else {stopDrawing();lockMap(false)}
+  e.preventDefault();
+}
+mapEl.addEventListener('pointerdown',startFreehand,{passive:false});
+mapEl.addEventListener('pointermove',moveFreehand,{passive:false});
+mapEl.addEventListener('pointerup',endFreehand,{passive:false});
+mapEl.addEventListener('pointercancel',endFreehand,{passive:false});
+mapEl.addEventListener('lostpointercapture',()=>{if(activePointer!==null){activePointer=null;if(drawing&&points.length)finish();else{stopDrawing();lockMap(false)}}});
+
+$('draw').onclick=()=>{
+  if(animating){status('Подожди завершение текущего захвата.');return}
+  drawing=true;points=[];preview();
+  status('Зажми палец и рисуй границу. Отпусти — захват начнётся сразу.');
+};
+$('fill').onclick=()=>{
+  if(animating){status('Подожди завершение текущего захвата.');return}
+  if(!last){status('Сначала нарисуй область.');return}
+  const footprint=clone(last.feature),who=last.owner,oldSt=snapshot();
+  let tr;
+  try{tr=calculateTransition(footprint,who,oldSt)}catch(_){
+    status('Не удалось безопасно обработать последнюю область. Нарисуй её ещё раз.');
+    return;
+  }
+  if(!valid(tr.changed)){status('Эта область уже принадлежит выбранной стороне.');return}
+  const changedArea=area(tr.changed),newSt=tr.newState,sett=changedSettlements(footprint,oldSt,newSt,who);
+  history.push({snapshot:oldSt,stats:snapshotStats(),previousLast:snapshotLast(),shape:clone(footprint),owner:who}); animating=true;lockMap(true);status('Захват начался…');
+  animateTransition(footprint,who,oldSt,newSt,tr.changed,()=>{
+    statsData[who].attacks++;statsData[who].area+=changedArea;statsData[who].settlements+=sett.length;
+    const lines=[`${who==='A'?'🇺🇦 Украина':'🇷🇺 Россия'} продвижение: ${formatArea(changedArea)} км²`];
+    sett.slice(0,8).forEach(n=>lines.push(`${n} ${/а$|я$|ка$|ца$/i.test(n.trim())?'перешла':'перешли'} под контроль: ${who==='A'?'Украины':'России'}`));
+    if(sett.length>8)lines.push(`+ ещё ${sett.length-8} населённых пунктов`);showToast(lines);
+    status('Захват завершён — можно рисовать дальше.');
+  });
+};
+
+$('undo').onclick=()=>{
+  if(animating){status('Подожди завершение текущего захвата.');return}
+  const h=history.pop(); if(!h){status('Нечего отменять.');return}
+  restore(h.snapshot);
+  restoreStats(h.stats || {A:{attacks:0,area:0,settlements:0},B:{attacks:0,area:0,settlements:0}});
+  last=h.previousLast?{feature:clone(h.previousLast.feature),owner:h.previousLast.owner}:null;
+  status('Последнее изменение отменено.');
+};
+$('clear').onclick=()=>{
+  if(animating){status('Подожди завершение текущего захвата.');return}
+  history=[];last=null;stopDrawing();statsData.A={attacks:0,area:0,settlements:0};statsData.B={attacks:0,area:0,settlements:0};
+  loadBase();status('Все изменения очищены. Исходная карта восстановлена.');
+};
+$('center').onclick=()=>map.setView([49.0,31.2],6);
+$('fit').onclick=()=>map.fitBounds([[44,22],[53.8,40.5]]);
+$('stats').onclick=()=>{
+  const body=$('statsBody');body.innerHTML=`<div class="statrow"><span>🇺🇦 Украина — наступлений</span><span class="statv">${statsData.A.attacks}</span></div><div class="statrow"><span>🇺🇦 Захвачено всего</span><span class="statv">${formatArea(statsData.A.area)} км²</span></div><div class="statrow"><span>🇺🇦 Населённых пунктов перешло под контроль</span><span class="statv">${statsData.A.settlements}</span></div><div class="statrow"><span>🇷🇺 Россия — наступлений</span><span class="statv">${statsData.B.attacks}</span></div><div class="statrow"><span>🇷🇺 Захвачено всего</span><span class="statv">${formatArea(statsData.B.area)} км²</span></div><div class="statrow"><span>🇷🇺 Населённых пунктов перешло под контроль</span><span class="statv">${statsData.B.settlements}</span></div>`;$('statsPanel').style.display='block';
+};
+$('closeStats').onclick=()=>$('statsPanel').style.display='none';
+
+const dsUrls=[
+  'https://cdn.jsdelivr.net/gh/cyterat/deepstate-map-data@main/data/deepstatemap_data_20260928.geojson',
+  'https://raw.githubusercontent.com/cyterat/deepstate-map-data/main/data/deepstatemap_data_20260928.geojson'
+];
+function loadBase(){
+  if(!baseData)return;
+  // IMPORTANT: do NOT combine/union the whole source on startup.
+  // The source contains many detailed polygons; merging them can freeze
+  // mobile browsers for minutes before Leaflet gets a chance to render.
+  const fs=(baseData.features||[]).map(clone).filter(f=>f&&f.geometry);
+  const b=fs.length?turf.featureCollection(fs):null;
+  state={A:null,B:b};
+  grayZones=null;
+  clearTimeout(grayRebuildTimer);
+  grayBuildToken++;
+  // Render the real source immediately. No synthetic gray buffer is built.
+  renderState(true);
+}
+async function fetchGeoJsonWithTimeout(url,ms=15000){
+  const c=new AbortController();
+  const timer=setTimeout(()=>c.abort(),ms);
+  try{
+    const r=await fetch(url,{signal:c.signal,cache:'no-store'});
+    if(!r.ok)throw Error(r.status);
+    return await r.json();
+  }finally{clearTimeout(timer)}
+}
+(async()=>{
+  let loaded=null;
+  for(const url of dsUrls){
+    try{loaded=await fetchGeoJsonWithTimeout(url);if(loaded)break}catch(_){ }
+  }
+  if(loaded){
+    baseData=loaded;
+    loadBase();
+    status('Карта готова. Нажми «Наступать» и рисуй пальцем.');
+  }else{
+    baseData={type:'FeatureCollection',features:[]};
+    loadBase();
+    status('Не удалось загрузить данные карты. Проверь интернет и открой файл ещё раз.');
+  }
+})();
+function loadSettlementsData(data){
+  let list=[];
+  if(Array.isArray(data)) list=data;
+  else if(Array.isArray(data?.settlements)) list=data.settlements;
+  else if(Array.isArray(data?.data)) list=data.data;
+  else if(Array.isArray(data?.features)) list=data.features.map(f=>({name:f.properties?.name||f.properties?.NAME||f.properties?.name_uk||f.properties?.name_ru,location:f.geometry?.coordinates}));
+  settlements=list.filter(x=>x&&x.name&&settlementCoords(x));
+  // Guaranteed fallback for Mala Tokmachka if an external settlement mirror is unavailable.
+  if(!settlements.some(x=>String(x.name).toLowerCase().includes('мала токмачка')||String(x.name).toLowerCase().includes('mala tokmachka'))){
+    settlements.push({name:'Мала Токмачка',location:[35.90066,47.53440]});
+  }
+}
+fetch('https://cdn.jsdelivr.net/gh/bnotezz/ua-settlements@main/assets/data/settlements.json').then(r=>{if(!r.ok)throw Error(r.status);return r.json()}).then(loadSettlementsData).catch(()=>fetch('https://raw.githubusercontent.com/bnotezz/ua-settlements/main/assets/data/settlements.json').then(r=>{if(!r.ok)throw Error(r.status);return r.json()}).then(loadSettlementsData).catch(()=>loadSettlementsData([])));
+</script>
+</body>
+</html>
